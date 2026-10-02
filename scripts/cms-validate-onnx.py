@@ -210,6 +210,8 @@ def main():
     # Set seeds for reproducibility during model initialization and export
     torch.manual_seed(42)
     np.random.seed(42)
+    if args.device == "cuda":
+        torch.set_float32_matmul_precision("high")
 
     torch.set_num_threads(args.num_threads)
     os.makedirs(args.outdir, exist_ok=True)
@@ -290,7 +292,7 @@ def main():
             configs = [
                 "PT_ATTN_MATH_FP32",
                 "PT_ATTN_MATH_FP16",
-                "PT_ATTN_FLASH_FP32",
+                # "PT_ATTN_FLASH_FP32",
                 "PT_ATTN_FLASH_FP16",
                 "ONNX_ATTN_MATH_FP32",
                 "ONNX_ATTN_MATH_FP16",
@@ -549,7 +551,7 @@ def main():
             model.load_state_dict(model_state["model_state_dict"], strict=False)
             model = model.to(device=args.device)
 
-        elif cfg in ["PT_ATTN_FLASH_FP32", "PT_ATTN_FLASH_FP16"]:
+        elif cfg in ["PT_ATTN_FLASH_FP16"]:
             print("Initializing PyTorch Flash model...")
             model_kwargs_flash = model_kwargs.model_copy(deep=True)
             model = MLPF(
@@ -637,8 +639,8 @@ def main():
                         with torch.autocast(device_type=args.device, dtype=torch.float16, enabled=(args.device == "cuda")):
                             with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
                                 _ = model(X_warmup, mask_warmup)
-                    elif cfg == "PT_ATTN_FLASH_FP32":
-                        _ = model(X_warmup, mask_warmup)
+                    # elif cfg == "PT_ATTN_FLASH_FP32":
+                    #     _ = model(X_warmup, mask_warmup)
                     elif cfg == "PT_ATTN_FLASH_FP16":
                         with torch.autocast(device_type=args.device, dtype=torch.float16, enabled=(args.device == "cuda")):
                             _ = model(X_warmup, mask_warmup)
@@ -698,9 +700,9 @@ def main():
                         with torch.autocast(device_type=args.device, dtype=torch.float16, enabled=(args.device == "cuda")):
                             with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
                                 pred = model(X_features_padded, mask)
-                elif cfg == "PT_ATTN_FLASH_FP32":
-                    with torch.no_grad():
-                        pred = model(X_features_padded, mask)
+                # elif cfg == "PT_ATTN_FLASH_FP32":
+                #     with torch.no_grad():
+                #         pred = model(X_features_padded, mask)
                 elif cfg == "PT_ATTN_FLASH_FP16":
                     with torch.no_grad():
                         with torch.autocast(device_type=args.device, dtype=torch.float16, enabled=(args.device == "cuda")):

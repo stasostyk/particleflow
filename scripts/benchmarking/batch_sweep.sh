@@ -32,7 +32,7 @@ nvidia-smi
 uv run --project envs/ort-gpu --no-sync \
     python scripts/benchmarking/batch_sweep.py \
     --runner scripts/benchmarking/inference.py \
-    --onnx-model ./onnx_benchmarks/gpu/model_fused_fp16.onnx \
+    --onnx-model ./onnx_benchmarks/accuracy_check/model_fused_fp16.onnx \
     --data-dir ~/ceph \
     --dataset cms_pf_ttbar \
     --num-events 500 \
@@ -40,4 +40,5 @@ uv run --project envs/ort-gpu --no-sync \
     --warmup-runs 2 \
     --benchmark-repeats 3 \
     --continue-on-error \
-    --outdir ./batch_sweep_fused_fp16_h200
+    --pad-bin-size 8 \
+    --outdir ./batch_16

@@ -256,10 +256,10 @@ def _set_batch_axis(ax: plt.Axes, batch_sizes: np.ndarray) -> None:
     ax.set_xticks(batch_sizes)
     ax.set_xticklabels([str(int(x)) for x in batch_sizes])
     ax.grid(True, alpha=0.25)
-    if len(batch_sizes) > 1 and np.all(batch_sizes > 0):
-        ratios = batch_sizes[1:] / batch_sizes[:-1]
-        if np.allclose(ratios, ratios[0]) and ratios[0] > 1.0:
-            ax.set_xscale("log", base=ratios[0])
+    # if len(batch_sizes) > 1 and np.all(batch_sizes > 0):
+    #     ratios = batch_sizes[1:] / batch_sizes[:-1]
+    #     if np.allclose(ratios, ratios[0]) and ratios[0] > 1.0:
+    #         ax.set_xscale("log", base=ratios[0])
 
 
 def make_pdf(rows: list[dict[str, Any]], model_path: str, output_pdf: Path) -> None:
