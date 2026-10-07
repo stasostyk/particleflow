@@ -12,7 +12,7 @@ Usage
         --vary batch-size --values 1 2 4 8 16 32 \
         --title "MLPF attention inference, A100" \
         --output sweep_batch_size.pdf \
-        --checkpoint ... --model-kwargs ... --data-dir ... --num-events 200 --num-repeats 5
+        --checkpoint ... --model-kwargs ... --data-dir ... --num-events 200 --num-repeats 5 --onnx-dir ...
 
 Any runner argument may be passed through unchanged. If the varied parameter is also
 given as a fixed value, the fixed value is ignored with a warning.
@@ -64,6 +64,8 @@ PASSTHROUGH_ARGS = {
     "compile": "flag",
     "sort_by_length": "flag",
     "configs": "list",
+    "onnx_dir": "value",
+    "force_export": "flag",
 }
 
 CONFIDENCE = 0.95
@@ -99,6 +101,8 @@ def parse_args() -> argparse.Namespace:
     runner.add_argument("--compile", action="store_true")
     runner.add_argument("--sort-by-length", action="store_true")
     runner.add_argument("--configs", nargs="+")
+    runner.add_argument("--onnx-dir", help="Shared directory for the exported ONNX models; default: a temporary one exported once per sweep")
+    runner.add_argument("--force-export", action="store_true")
 
     args = parser.parse_args()
     if len(set(args.values)) != len(args.values):
@@ -231,6 +235,10 @@ def collect(args: argparse.Namespace) -> tuple[dict[int, dict[str, ScenarioSampl
     scenario_order: list[str] = []
 
     with tempfile.TemporaryDirectory(prefix="mlpf_sweep_") as tmp:
+        # Export once and reuse across all sweep values unless the user supplied a
+        # persistent --onnx-dir, in which case it is reused across sweeps as well.
+        if args.onnx_dir is None:
+            args.onnx_dir = os.path.join(tmp, "onnx")
         for value in args.values:
             outdir = os.path.join(tmp, f"{args.vary}_{value}")
             summary = run_benchmark(build_command(args, value, outdir), outdir)

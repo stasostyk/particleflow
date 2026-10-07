@@ -207,7 +207,15 @@ def parse_args():
     parser.add_argument("--model-kwargs", type=str, required=True, help="Path to the model_kwargs.pkl file")
     parser.add_argument("--dataset", type=str, default="cms_pf_ttbar", help="TFDS dataset name")
     parser.add_argument("--data-dir", type=str, required=True, help="Directory for TFDS datasets")
-    parser.add_argument("--outdir", type=str, default="./batched_benchmark", help="Output directory for ONNX files, plots and JSON")
+    parser.add_argument("--outdir", type=str, default="./batched_benchmark", help="Output directory for plots and JSON")
+    parser.add_argument(
+        "--onnx-dir",
+        type=str,
+        default=None,
+        help="Directory for exported ONNX models (default: --outdir). Existing files are reused unless --force-export is given.",
+    )
+    parser.add_argument("--force-export", action="store_true", help="Re-export ONNX models even if they already exist in --onnx-dir")
+    parser.add_argument("--export-only", action="store_true", help="Export the ONNX models and exit without benchmarking")
     parser.add_argument("--num-events", type=int, default=100, help="Number of events to benchmark")
     parser.add_argument("--batch-size", type=int, default=8, help="Batch size for the batched scenarios")
     parser.add_argument("--pad-bin-size", type=int, default=0, help="Round padded sequence lengths up to a multiple of this value (0 = disabled)")
@@ -305,8 +313,14 @@ def register_sdpa_symbolic(num_heads, precision):
     )
 
 
-def export_onnx_models(configs, base_config, state_dict, num_heads, input_dim, pad_multiple, device, outdir):
-    """Export one ONNX file per requested ONNX scenario. Returns {config: path}."""
+def export_onnx_models(configs, base_config, state_dict, num_heads, input_dim, pad_multiple, device, onnx_dir, force=False):
+    """
+    Export one ONNX file per requested ONNX scenario. Returns {config: path}.
+
+    Files already present in ``onnx_dir`` are reused unless ``force`` is set. The export
+    is checkpoint-specific, so point ``--onnx-dir`` at a fresh directory (or pass
+    ``--force-export``) when the checkpoint changes; nothing here detects a stale file.
+    """
     # Attention type SIMPLE + export_onnx_fused=True produces a graph in which attention
     # is a single SDPA call that our custom symbolic can intercept.
     export_config = make_mlpf_config(base_config, attention_type=AttentionType.SIMPLE, export_onnx_fused=True)
@@ -317,21 +331,29 @@ def export_onnx_models(configs, base_config, state_dict, num_heads, input_dim, p
     dummy_x = torch.randn(1, dummy_len, input_dim, device=device)
     dummy_mask = torch.ones(1, dummy_len, device=device)
 
+    os.makedirs(onnx_dir, exist_ok=True)
     paths = {}
     for cfg in configs:
         spec = SCENARIOS[cfg]
         if spec["backend"] != "onnx":
             continue
-        path = os.path.join(outdir, spec["filename"])
+        path = os.path.join(onnx_dir, spec["filename"])
+        paths[cfg] = path
+        if os.path.isfile(path) and not force:
+            print(f"Reusing existing ONNX model for {cfg}: {path}")
+            continue
         print(f"Exporting {cfg} -> {path}")
 
         model = build_model(export_config, state_dict, device, half=spec["half_model"])
         register_sdpa_symbolic(num_heads, spec["sdpa_precision"])
         inputs = (dummy_x.half(), dummy_mask.half()) if spec["half_model"] else (dummy_x, dummy_mask)
+        # Export to a process-specific temporary name and rename atomically, so a
+        # concurrent process sharing --onnx-dir never sees a partially written file.
+        tmp_path = f"{path}.{os.getpid()}.tmp"
         torch.onnx.export(
             model,
             inputs,
-            path,
+            tmp_path,
             opset_version=ONNX_OPSET,
             input_names=INPUT_NAMES,
             output_names=OUTPUT_NAMES,
@@ -339,7 +361,7 @@ def export_onnx_models(configs, base_config, state_dict, num_heads, input_dim, p
             dynamo=False,
             verbose=False,
         )
-        paths[cfg] = path
+        os.replace(tmp_path, path)
         del model
         gc.collect()
         torch.cuda.empty_cache()
@@ -353,6 +375,20 @@ def export_onnx_models(configs, base_config, state_dict, num_heads, input_dim, p
 MIB = 1024**2
 
 
+def nvml_handle_for_torch_device(device_id=0):
+    """
+    NVML handle of the GPU PyTorch calls ``cuda:<device_id>``.
+
+    NVML indexes physical GPUs and ignores CUDA_VISIBLE_DEVICES, whereas CUDA (and so
+    PyTorch and ORT) index the visible subset. Under Slurm with one GPU per task the two
+    differ, so we look the device up by UUID instead of by index.
+    """
+    uuid = getattr(torch.cuda.get_device_properties(device_id), "uuid", None)
+    if uuid is not None:
+        return pynvml.nvmlDeviceGetHandleByUUID(f"GPU-{uuid}")
+    return pynvml.nvmlDeviceGetHandleByIndex(device_id)  # old PyTorch: best effort
+
+
 def process_gpu_memory_mib(device_id=0):
     """
     GPU memory used by *this process* in MiB, read through NVML. Covers every allocator
@@ -362,7 +398,7 @@ def process_gpu_memory_mib(device_id=0):
     if not NVML_AVAILABLE:
         return None
     try:
-        handle = pynvml.nvmlDeviceGetHandleByIndex(device_id)
+        handle = nvml_handle_for_torch_device(device_id)
         for proc in pynvml.nvmlDeviceGetComputeRunningProcesses(handle):
             if proc.pid == os.getpid() and proc.usedGpuMemory is not None:
                 return proc.usedGpuMemory / MIB
@@ -866,7 +902,11 @@ def main():
     configs = [BASELINE] + list(args.configs)
 
     # ---- ONNX export -----------------------------------------------------------------
-    onnx_paths = export_onnx_models(configs, base_config, state_dict, num_heads, input_dim, pad_multiple, device, args.outdir)
+    onnx_dir = args.onnx_dir or args.outdir
+    onnx_paths = export_onnx_models(configs, base_config, state_dict, num_heads, input_dim, pad_multiple, device, onnx_dir, force=args.force_export)
+    if args.export_only:
+        print(f"ONNX models exported to {onnx_dir}; exiting (--export-only).")
+        return
 
     # ---- Data ------------------------------------------------------------------------
     print(f"Loading dataset {args.dataset} from {args.data_dir}")
