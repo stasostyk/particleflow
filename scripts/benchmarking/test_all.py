@@ -105,23 +105,23 @@ import time
 # Make the local ``mlpf`` package importable when running from the repository root.
 sys.path.insert(0, os.getcwd())
 
-import awkward  # noqa: E402
-import boost_histogram as bh  # noqa: E402
-import fastjet  # noqa: E402
-import matplotlib  # noqa: E402
-import mplhep  # noqa: E402
-import numpy as np  # noqa: E402
-import onnx  # noqa: E402
-import onnxruntime as rt  # noqa: E402
-import onnxscript  # noqa: E402
-import tensorflow_datasets as tfds  # noqa: E402
-import torch  # noqa: E402
-import vector  # noqa: E402
-from onnxscript import opset20 as op  # noqa: E402
-from tqdm import tqdm  # noqa: E402
+import awkward
+import boost_histogram as bh
+import fastjet
+import matplotlib
+import mplhep
+import numpy as np
+import onnx
+import onnxruntime as rt
+import onnxscript
+import tensorflow_datasets as tfds
+import torch
+import vector
+from onnxscript import opset20 as op
+from tqdm import tqdm
 
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
+import matplotlib.pyplot as plt
 
 try:  # NVML is optional; without it only PyTorch-side memory statistics are reported.
     import pynvml
@@ -131,9 +131,9 @@ try:  # NVML is optional; without it only PyTorch-side memory statistics are rep
 except Exception:  # pragma: no cover - depends on the environment
     NVML_AVAILABLE = False
 
-from mlpf.conf import AttentionType, MLPFConfig, ModelType  # noqa: E402
-from mlpf.model.mlpf import MLPF  # noqa: E402
-from mlpf.model.utils import unpack_predictions  # noqa: E402
+from mlpf.conf import AttentionType, MLPFConfig, ModelType
+from mlpf.model.mlpf import MLPF
+from mlpf.model.utils import unpack_predictions
 
 # --------------------------------------------------------------------------------------
 # Constants
@@ -149,9 +149,9 @@ DYNAMIC_AXES = {name: {0: "num_batch", 1: "num_elements"} for name in INPUT_NAME
 BASELINE = "PT_ATTN_MATH_FP32"
 BATCHED_CONFIGS = [
     "PT_ATTN_FLASH_FP16",
-    "ONNX_ATTN_FLASH_FP32",
-    "ONNX_ATTN_FLASH_FP32_FP16",
-    "ONNX_ATTN_FLASH_FP16",
+    # "ONNX_ATTN_FLASH_FP32",
+    # "ONNX_ATTN_FLASH_FP32_FP16",
+    # "ONNX_ATTN_FLASH_FP16",
 ]
 
 # Declarative description of each scenario. To add a scenario: add an entry here and,
@@ -160,12 +160,14 @@ SCENARIOS = {
     "PT_ATTN_MATH_FP32": dict(
         backend="torch",
         attention_type=AttentionType.MATH,
+        use_jagged_attention=False,
         autocast=False,
         sdpa_backend=torch.nn.attention.SDPBackend.MATH,
     ),
     "PT_ATTN_FLASH_FP16": dict(
         backend="torch",
         attention_type=AttentionType.FLASH,
+        use_jagged_attention=True,
         autocast=True,
         sdpa_backend=None,  # let SDPA choose the fastest fused kernel
     ),
@@ -253,7 +255,7 @@ def make_mlpf_config(base_config, **overrides):
     """Deep-copy the config and apply attention / top-level / model-level overrides."""
     config = base_config.model_copy(deep=True)
     for k, v in overrides.items():
-        if k in ["export_onnx_fused", "save_attention", "attention_type"]:
+        if k in ["export_onnx_fused", "save_attention", "attention_type", "use_jagged_attention", "use_flash_attn_verlen"]:
             if config.model.type == ModelType.ATTENTION:
                 setattr(config.model.attention, k, v)
         elif hasattr(config, k):
@@ -267,50 +269,53 @@ def build_model(base_config, state_dict, device, half=False, **overrides):
     """Instantiate MLPF with config overrides, load weights and move to ``device``."""
     model = MLPF(config=make_mlpf_config(base_config, **overrides))
     model.eval()
-    model.load_state_dict(state_dict, strict=False)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing or unexpected:
+        raise RuntimeError(f"state_dict mismatch: missing={missing} unexpected={unexpected}")
     model = model.to(device)
     if half:
         model = model.half()
     return model
 
 
+from torch.onnx import symbolic_helper as sym_help
+
 def register_sdpa_symbolic(num_heads, precision):
-    """
-    Map ``aten::scaled_dot_product_attention`` to ``com.microsoft.MultiHeadAttention``
-    during ONNX export. ``precision="fp16"`` casts Q/K/V to FP16 inside the op and
-    casts the output back to the query dtype, so it can be used in an FP32 graph.
-    """
     custom_opset = onnxscript.values.Opset(domain="onnx-script", version=1)
     msft_op = onnxscript.values.Opset("com.microsoft", 1)
+    F16 = onnx.TensorProto.FLOAT16
 
     if precision == "fp16":
-
         @onnxscript.script(custom_opset)
         def SDPA(query, key, value):
-            q16 = op.Cast(query, to=onnx.TensorProto.FLOAT16)
-            k16 = op.Cast(key, to=onnx.TensorProto.FLOAT16)
-            v16 = op.Cast(value, to=onnx.TensorProto.FLOAT16)
-            output, _, _ = msft_op.MultiHeadAttention(q16, k16, v16, num_heads=num_heads)
-            return op.CastLike(output, query)
+            out, _, _ = msft_op.MultiHeadAttention(op.Cast(query, to=F16), op.Cast(key, to=F16), op.Cast(value, to=F16), num_heads=num_heads)
+            return op.CastLike(out, query)
 
+        @onnxscript.script(custom_opset)
+        def SDPA_masked(query, key, value, keep):
+            kpm = op.Cast(op.Squeeze(keep, op.Constant(value_ints=[1])), to=onnx.TensorProto.INT32)  # (B, L), 1 = valid
+            out, _, _ = msft_op.MultiHeadAttention(op.Cast(query, to=F16), op.Cast(key, to=F16), op.Cast(value, to=F16), None, kpm, num_heads=num_heads)
+            return op.CastLike(out, query)
     elif precision == "fp32":
-
         @onnxscript.script(custom_opset)
         def SDPA(query, key, value):
-            output, _, _ = msft_op.MultiHeadAttention(query, key, value, num_heads=num_heads)
-            return output
+            out, _, _ = msft_op.MultiHeadAttention(query, key, value, num_heads=num_heads)
+            return out
 
+        @onnxscript.script(custom_opset)
+        def SDPA_masked(query, key, value, keep):
+            kpm = op.Cast(op.Squeeze(keep, op.Constant(value_ints=[1])), to=onnx.TensorProto.INT32)
+            out, _, _ = msft_op.MultiHeadAttention(query, key, value, None, kpm, num_heads=num_heads)
+            return out
     else:
         raise ValueError(f"Unknown SDPA precision {precision}")
 
     def symbolic(g, query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, enable_gqa=False):
-        return g.onnxscript_op(SDPA, query, key, value).setType(query.type())
+        if attn_mask is None or sym_help._is_none(attn_mask):
+            return g.onnxscript_op(SDPA, query, key, value).setType(query.type())
+        return g.onnxscript_op(SDPA_masked, query, key, value, attn_mask).setType(query.type())
 
-    torch.onnx.register_custom_op_symbolic(
-        symbolic_name="aten::scaled_dot_product_attention",
-        symbolic_fn=symbolic,
-        opset_version=ONNX_OPSET,
-    )
+    torch.onnx.register_custom_op_symbolic("aten::scaled_dot_product_attention", symbolic, ONNX_OPSET)
 
 
 def export_onnx_models(configs, base_config, state_dict, num_heads, input_dim, pad_multiple, device, onnx_dir, force=False):
@@ -323,7 +328,7 @@ def export_onnx_models(configs, base_config, state_dict, num_heads, input_dim, p
     """
     # Attention type SIMPLE + export_onnx_fused=True produces a graph in which attention
     # is a single SDPA call that our custom symbolic can intercept.
-    export_config = make_mlpf_config(base_config, attention_type=AttentionType.SIMPLE, export_onnx_fused=True)
+    export_config = make_mlpf_config(base_config, attention_type=AttentionType.SIMPLE, export_onnx_fused=True, use_jagged_attention=False)
 
     dummy_len = 400
     if pad_multiple > 0:
@@ -548,6 +553,7 @@ def make_runner(cfg, base_config, state_dict, onnx_paths, args, device):
             state_dict,
             device,
             attention_type=spec["attention_type"],
+            use_jagged_attention=spec["use_jagged_attention"],
             export_onnx_fused=False,
             save_attention=False,
         )
@@ -895,6 +901,8 @@ def main():
     if base_config.model.type != ModelType.ATTENTION:
         raise SystemExit(f"This benchmark only supports attention models, got {base_config.model.type}")
     state_dict = torch.load(args.checkpoint, map_location="cpu", weights_only=True)["model_state_dict"]
+    TRAINING_ONLY_PREFIXES = ("task_loss_weighter.",)
+    state_dict = {k: v for k, v in state_dict.items() if not k.startswith(TRAINING_ONLY_PREFIXES)}
     num_heads = base_config.model.attention.num_heads
     input_dim = base_config.input_dim
 
@@ -973,6 +981,8 @@ def main():
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=4)
     print(f"\nResults written to {summary_path}")
+
+    exit(0)
 
 
 if __name__ == "__main__":

@@ -310,8 +310,10 @@ class PreLnSelfAttentionLayer(nn.Module):
         self.input_norm = (x.values if jagged_input else x).norm().detach()
         self.seq_len = mask.shape[1] if jagged_input else x.shape[1]
 
+        key_padding_mask = None
         if mask is not None and not jagged_input:
             mask_ = mask.unsqueeze(-1)
+            key_padding_mask = ~mask.bool()
 
         residual = x
         x_norm = x.with_values(self.norm0(x.values)) if jagged_input else self.norm0(x)
@@ -327,7 +329,7 @@ class PreLnSelfAttentionLayer(nn.Module):
         if mask is not None and not jagged_input:
             q = q * mask_
 
-        mha_out = self.mha(q, x_norm, x_norm, need_weights=False)[0]
+        mha_out = self.mha(q, x_norm, x_norm, need_weights=False, key_padding_mask=key_padding_mask)[0]
 
         self.mha_res_norm = (mha_out.values if jagged_input else mha_out).norm().detach()
 
