@@ -42,26 +42,16 @@ nvidia-smi
 #     --num-events 10 \
 #     --device cuda
 
-# uv run --project envs/ort-gpu --no-sync \
-#     python scripts/benchmarking/batch_sweep.py \
-#     --runner scripts/benchmarking/inference.py \
-#     --onnx-model ./test1/model_fused_fp16.onnx \
-#     --data-dir ~/ \
-#     --dataset cms_pf_ttbar \
-#     --num-events 500 \
-#     --batch-sizes 1 2 4 8 16 32 \
-#     --warmup-runs 2 \
-#     --benchmark-repeats 3 \
-#     --continue-on-error \
-#     --pad-bin-size 8 \
-#     --outdir ./batch_8
-
-srun uv run --project envs/ort-gpu --no-sync \
-    python scripts/benchmarking/tentative_script.py \
-    --checkpoint ~/latest-cms/onnx_ref_pyg-cms-v1_cms_run3_20260930_105918_812327/checkpoints/checkpoint-500.pth \
-    --dataset cms_pf_ttbar \
-    --model-kwargs ~/latest-cms/onnx_ref_pyg-cms-v1_cms_run3_20260930_105918_812327/model_kwargs.pkl \
+uv run --project envs/ort-gpu --no-sync \
+    python scripts/benchmarking/batch_sweep.py \
+    --runner scripts/benchmarking/inference.py \
+    --onnx-model ./test1/model_fused_fp16.onnx \
     --data-dir ~/ \
-    --outdir test1 \
-    --num-events 10 \
-    --device cuda
+    --dataset cms_pf_ttbar \
+    --num-events 500 \
+    --batch-sizes 1 2 4 8 16 32 \
+    --warmup-runs 2 \
+    --benchmark-repeats 3 \
+    --continue-on-error \
+    --pad-bin-size 8 \
+    --outdir ./batch_8

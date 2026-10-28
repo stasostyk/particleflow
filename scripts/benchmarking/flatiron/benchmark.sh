@@ -31,25 +31,25 @@ module load slurm gcc cmake
 
 nvidia-smi
 
-CKPT="$HOME/colliderml_pu200_pyg-colliderml-pu200-v1_colliderml_20261013_063020_713942/checkpoints/checkpoint-40000.pth"
-KWRGS="$HOME/colliderml_pu200_pyg-colliderml-pu200-v1_colliderml_20261013_063020_713942/model_kwargs.pkl"
+CKPT="$FAST/colliderml/checkpoint-40000.pth"
+KWRGS="$FAST/colliderml/model_kwargs.pkl"
 
-DATA_DIR="/mnt/ceph/users/ewulff/tensorflow_datasets/colliderml/"
+DATA_DIR="$FAST/"
 
-uv run --project envs/ort-gpu --no-sync python scripts/benchmarking/pt_batch_sweep.py \
+uv run --project envs/ort-gpu --no-sync python scripts/benchmarking/benchmark.py \
     --checkpoint $CKPT \
     --data-dir $DATA_DIR \
-    --dataset colliderml_ttbar_pu200_pf \
-    --num-events 500 \
+    --dataset dataset \
+    --num-events 50 \
     --outdir test_new_baseline_EXTRA_LARGE \
     --model-kwargs $KWRGS \
     --allow-partial-state \
     --warmup-iters 3 \
     --pdf \
     --repeats 10 \
-    --batch-sizes 1 2 4 8 \
+    --batch-sizes 1 2 4 \
     --pad-bin-size 8 \
     --compile-mode default \
     --warmup-seq-len 20000 \
-    --variants fp32_efficient fp16_flash bf16_flash \
+    --variants fp16_flash bf16_flash \
     --compile
