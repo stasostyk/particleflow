@@ -95,6 +95,11 @@ def is_jagged_tensor(tensor):
     return isinstance(tensor, PackedJaggedTensor)
 
 
+# Inductor corrupts B=1 predictions when compiling this data-dependent jagged
+# packing path (boolean-indexed tensor + runtime sequence offsets). Keep the
+# packing in eager PyTorch; the surrounding backbone and FlashAttention still
+# run with torch.compile and the native fused attention kernel, respectively.
+@torch.compiler.disable
 def dense_to_jagged(tensor, mask):
     valid = mask.bool()
     valid_lengths = valid.sum(dim=-1)
