@@ -1,20 +1,15 @@
 #!/usr/bin/env python3
 """MLPF CUDA benchmark orchestrator. Run from the MLPF repository root.
-
 Launches EXACTLY ONE worker process per variant, sequentially. The parent never
 uses CUDA; once a worker exits its CUDA context, allocated memory and allocator
 caches from that process are released before the next worker starts.
-
 Outputs: summary.json, optional comparison.pdf, per-variant worker JSON files,
 optional Chrome traces, and CPU reference_predictions.pt.
-
 Example:
-  python /path/to/benchmark.py --checkpoint model.pt --model-kwargs config.pkl \
+  python /path/to/benchmark.py --checkpoint model.pt --model-kwargs config.pkl \\
       --data-dir /path/to/tfds --variants fp16_flash bf16_flash --pdf
 """
-
 from __future__ import annotations
-
 import argparse
 from contextlib import nullcontext
 from datetime import datetime, timezone
@@ -25,7 +20,6 @@ import subprocess
 import tempfile
 import sys
 from typing import Any
-
 from benchmark_variants import REFERENCE_NAME, REGISTRY
 
 
@@ -55,6 +49,11 @@ def parse_args():
                    help="Reference-only emergency allocator clear interval; 0 keeps memory warm")
     p.add_argument("--baseline-memory-log-every", type=int, default=25)
     p.add_argument("--device", default="cuda:0")
+    reference_paths = p.add_mutually_exclusive_group()
+    reference_paths.add_argument("--reuse-reference", type=Path, default=None,
+                                 help="Reuse saved .pt reference predictions instead of recomputing them")
+    reference_paths.add_argument("--save-reference", type=Path, default=None,
+                                 help="Where to save newly computed reference predictions (default: outdir/reference_predictions.pt)")
     p.add_argument("--reference", choices=list(REGISTRY), default=REFERENCE_NAME,
                    help="Untimed B=1 reference model (never included in timing sweep)")
     p.add_argument("--variants", nargs="+", choices=list(REGISTRY), default=["fp16_flash"],
@@ -108,6 +107,16 @@ def parse_args():
     args.batch_sizes = sorted(args.batch_sizes)
     if not args.checkpoint.is_file() or not args.model_kwargs.is_file():
         p.error("--checkpoint and --model-kwargs must exist")
+    if args.reuse_reference:
+        if not args.reuse_reference.is_file():
+            p.error(f"Reference file does not exist: {args.reuse_reference}")
+        import torch
+        saved = torch.load(args.reuse_reference, map_location="cpu", weights_only=True)
+        if isinstance(saved, dict):
+            saved = next((saved[k] for k in ("predictions", "outputs", "events")
+                          if k in saved), saved)
+        if len(saved) < args.num_events:
+            p.error(f"Reference has only {len(saved)} events; --num-events requires {args.num_events}")
     return args
 
 
@@ -125,12 +134,10 @@ def render_pdf(report: dict[str, Any], path: Path) -> None:
     import matplotlib.pyplot as plt
     from matplotlib.backends.backend_pdf import PdfPages
     import numpy as np
-
     variants = [v for v in report["variants"] if v != report["reference"]]
     batches = report["batch_sizes"]
     results = report["results"]
     colors = {v: plt.get_cmap("tab10")(i % 10) for i, v in enumerate(variants)}
-
     def stat(b: int, variant: str, scope: str, key: str, field="mean"):
         try:
             timing = results[str(b)][variant]["timings"][scope]
@@ -140,14 +147,12 @@ def render_pdf(report: dict[str, Any], path: Path) -> None:
             return float(item[field]) if item is not None else float("nan")
         except (KeyError, TypeError):
             return float("nan")
-
     def value(b: int, variant: str, section: str, key: str):
         try:
             raw = results[str(b)][variant][section][key]
             return float(raw) if raw is not None else float("nan")
         except (KeyError, ValueError, TypeError):
             return float("nan")
-
     def plot_lines(ax, key, scope="gpu_only", secondary_scope=False, confidence=False):
         for variant in variants:
             for selected_scope, line in (("gpu_only", "-"), ("e2e", "--")):
@@ -164,7 +169,6 @@ def render_pdf(report: dict[str, Any], path: Path) -> None:
         ax.set_xticks(batches)
         ax.grid(alpha=0.18)
         ax.set_axisbelow(True)
-
     with PdfPages(path) as pdf:
         fig, axes = plt.subplots(3, 2, figsize=(16.5, 12.0), layout="constrained")
         fig.suptitle("MLPF  |  isolated-process CUDA inference benchmark", fontsize=17,
@@ -205,7 +209,6 @@ def render_pdf(report: dict[str, Any], path: Path) -> None:
             ax_compile.plot(batches, overhead, "o-", color=colors[name], label=name)
         ax_compile.set(title="Real-batch prewarm wall time (compile + inference)",
                        ylabel="Seconds (UNTIMED)", xlabel="Batch size")
-
         markers = {"id": "o", "momentum": "s", "pu": "^"}
         styles = {"id": "-", "momentum": "--", "pu": ":"}
         for name in variants:
@@ -221,7 +224,6 @@ def render_pdf(report: dict[str, Any], path: Path) -> None:
         ax_accuracy.set(title=f"Per-head error vs {report['reference']} (symlog)",
                         xlabel="Batch size", ylabel="Mean |prediction - reference|")
         ax_accuracy.grid(axis="y", alpha=0.2)
-
         for ax in (ax_latency, ax_rate, ax_padding, ax_mem, ax_compile):
             ax.set_xticks(batches)
             ax.grid(alpha=0.18)
@@ -237,7 +239,6 @@ def render_pdf(report: dict[str, Any], path: Path) -> None:
             "NVML data/per-event errors in summary.json.", fontsize=8)
         pdf.savefig(fig, bbox_inches="tight")
         plt.close(fig)
-
         # Second page: operator hotspots, with an explicit warning about instrumented time.
         columns = 2
         rows = max(1, (len(variants) + columns - 1) // columns)
@@ -275,7 +276,6 @@ def render_pdf(report: dict[str, Any], path: Path) -> None:
                       "Full top-20 ops and timing statistics are in summary.json.", fontsize=8)
         pdf.savefig(fig, bbox_inches="tight")
         plt.close(fig)
-
         has_nvml = any(
             np.isfinite(stat(b, variant, "gpu_only", "mean_gpu_util_pct"))
             for variant in variants for b in batches
@@ -345,9 +345,13 @@ def main():
         "batch_consistency_events": args.batch_consistency_events,
     }
     variants = [args.reference, *args.variants]
+    reference_file = (args.reuse_reference or args.save_reference or
+                      root / "reference_predictions.pt").resolve()
+    if not args.reuse_reference:
+        reference_file.parent.mkdir(parents=True, exist_ok=True)
     job = {
         "reference": args.reference,
-        "reference_file": str(root / "reference_predictions.pt"),
+        "reference_file": str(reference_file),
         "trace_dir": str(root / "traces"),
         "settings": settings,
     }
@@ -388,8 +392,7 @@ def main():
     # scripts live elsewhere (Python scripts otherwise change sys.path[0]).
     env["PYTHONPATH"] = os.pathsep.join(x for x in [str(Path.cwd()),
                               str(worker_path.parent), env.get("PYTHONPATH", "")] if x)
-
-    for name in variants:
+    for name in (args.variants if args.reuse_reference else variants):
         output = root / "workers" / f"{name}.json"
         output.parent.mkdir(parents=True, exist_ok=True)
         output.unlink(missing_ok=True)
@@ -453,7 +456,6 @@ def main():
             raise SystemExit(completed.returncode)
         atomic_json(report, result_path)
         print(f"=== Worker {name} exited; its CUDA context is released ===", flush=True)
-
     report["status"] = "complete"
     report["completed_utc"] = datetime.now(timezone.utc).isoformat()
     atomic_json(report, result_path)
