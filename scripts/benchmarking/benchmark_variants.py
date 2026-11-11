@@ -190,6 +190,30 @@ VARIANTS: tuple[Variant, ...] = (
         Precision("bfloat16"),
         notes="Native BF16 cuDNN fused SDPA",
     ),
+    Variant(
+        "fp16_torch_sdpa_flash",
+        Attention(
+            "FLASH",
+            sdpa_backend="flash",
+            jagged=True,
+            varlen=False,
+            expected_ops=(r"_scaled_dot_product_flash_attention",),
+        ),
+        Precision("float16"),
+        notes="PyTorch Flash SDPA on packed jagged NestedTensors",
+    ),
+    Variant(
+        "bf16_torch_sdpa_flash",
+        Attention(
+            "FLASH",
+            sdpa_backend="flash",
+            jagged=True,
+            varlen=False,
+            expected_ops=(r"_scaled_dot_product_flash_attention",),
+        ),
+        Precision("bfloat16"),
+        notes="PyTorch Flash SDPA on packed jagged NestedTensors",
+    ),
 )
 
 # Example extension (NOT activated):

@@ -25,6 +25,7 @@ import threading
 import time
 import traceback
 from typing import Any
+import nvtx
 
 import numpy as np
 import torch
@@ -42,6 +43,7 @@ def dtype_of(name: str) -> torch.dtype:
     return dtype
 HEADS = {"id": 1, "momentum": 2, "pu": 3}
 MODES = ("e2e", "gpu_only")
+# MODES = ("gpu_only")
 
 
 def atomic_json(obj: dict[str, Any], path: Path) -> None:
@@ -645,7 +647,8 @@ def time_batch(model, variant, batch, mode: str, device, pinned):
         begin = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         begin.record()
-        out = forward(model, variant, x, mask)
+        with nvtx.annotate("fwd_pass", color="green"):
+            out = forward(model, variant, x, mask)
         end.record()
         end.synchronize()
         result_ms = begin.elapsed_time(end)
@@ -967,7 +970,14 @@ def run_job(job: dict[str, Any], variant_name: str, output: Path):
     if multiple:
         warm_len = (warm_len + multiple - 1) // multiple * multiple
     shape = (1, warm_len, config.input_dim)
-    verification = verify_dispatch(model, variant, config.input_dim, warm_len, device)
+    verification = (
+        verify_dispatch(model, variant, config.input_dim, warm_len, device)
+        if settings["profile"]
+        else {
+            "status": "unchecked",
+            "reason": "PyTorch profiler disabled"
+        }
+    )
     # Initialize eager libraries BEFORE compilation. Do not compile a synthetic
     # 256-token B=1 graph that the actual dataset never uses.
     warmup(model, variant, shape, device, settings["warmup_iters"])
@@ -1111,7 +1121,7 @@ def run_job(job: dict[str, Any], variant_name: str, output: Path):
                 del batches
             # Profiling and its extra graph specializations must NOT interfere
             # with the timed sweeps. Defer all profiler work until the end.
-            if compiled:
+            if compiled and settings["profile"]:
                 compiled_patterns = (variant.attention.compiled_expected_ops
                                      if variant.attention.compiled_expected_ops is not None
                                      else variant.attention.expected_ops)
