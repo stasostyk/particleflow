@@ -41,17 +41,18 @@ DATA_DIR="$FAST/"
 uv run --project envs/ort-gpu --no-sync python scripts/benchmarking/benchmark.py \
     --checkpoint $CKPT \
     --data-dir $DATA_DIR \
-    --dataset dataset \
+    --dataset small \
     --num-events 100 \
-    --outdir test_new_baseline_test_1_single_test_B2 \
+    --outdir test_small_compile_dynamic \
     --model-kwargs $KWRGS \
     --allow-partial-state \
     --warmup-iters 1 \
     --pdf \
-    --repeats 7 \
-    --batch-sizes 2 \
+    --repeats 3 \
+    --batch-sizes 1 2 4 8 16\
     --pad-bin-size 8 \
     --compile-mode default \
-    --warmup-seq-len 20000 \
-    --variants fp16_flash \
-    --compile
+    --warmup-seq-len 15000 \
+    --variants fp16_flash fp16_torch_sdpa_flash bf16_torch_sdpa_flash \
+    --save-reference reference-small-100.pt \
+    --compile-dynamic true

@@ -87,7 +87,7 @@ def parse_args():
     if (len(set(args.batch_sizes)) != len(args.batch_sizes)
             or any(b <= 0 for b in args.batch_sizes)
             or args.num_events < max(args.batch_sizes)
-            or args.repeats < 2 or args.warmup_iters < 1
+            or args.repeats < 1 or args.warmup_iters < 1
             or args.pad_bin_size < 0 or args.warmup_seq_len < 3
             or args.baseline_cache_clear_every < 0 or args.baseline_memory_log_every < 0
             or (args.fixed_seq_len is not None and args.fixed_seq_len <= 0)
