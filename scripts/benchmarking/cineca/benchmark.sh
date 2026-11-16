@@ -43,7 +43,7 @@ uv run --project envs/ort-gpu --no-sync python scripts/benchmarking/benchmark.py
     --data-dir $DATA_DIR \
     --dataset small \
     --num-events 100 \
-    --outdir test_small_compile_dynamic \
+    --outdir test \
     --model-kwargs $KWRGS \
     --allow-partial-state \
     --warmup-iters 1 \
@@ -53,6 +53,6 @@ uv run --project envs/ort-gpu --no-sync python scripts/benchmarking/benchmark.py
     --pad-bin-size 8 \
     --compile-mode default \
     --warmup-seq-len 15000 \
-    --variants fp16_flash fp16_torch_sdpa_flash bf16_torch_sdpa_flash \
+    --variants flash_attention_2_fp16 flash_attention_2_bf16 \
     --save-reference reference-small-100.pt \
     --compile-dynamic true

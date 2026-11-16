@@ -12,7 +12,6 @@ from collections import defaultdict
 from contextlib import nullcontext
 from datetime import datetime, timezone
 import gc
-from fnmatch import fnmatchcase
 import hashlib
 import json
 import math
@@ -25,7 +24,15 @@ import threading
 import time
 import traceback
 from typing import Any
-import nvtx
+try:
+    import nvtx
+except ImportError:
+    # NVTX ranges are optional; CUDA event timing and torch.profiler still work.
+    class _NoNvtx:
+        @staticmethod
+        def annotate(*args, **kwargs):
+            return nullcontext()
+    nvtx = _NoNvtx()
 
 import numpy as np
 import torch
@@ -36,15 +43,14 @@ from benchmark_variants import Variant, get_variant
 MIB = 1024 * 1024
 
 
-def dtype_of(name: str) -> torch.dtype:
-    dtype = getattr(torch, name, None)
-    if not isinstance(dtype, torch.dtype):
-        raise ValueError(f"Unsupported PyTorch dtype name: {name!r}")
-    return dtype
+
 HEADS = {"id": 1, "momentum": 2, "pu": 3}
 MODES = ("e2e", "gpu_only")
+FULL_FP16 = True
 # MODES = ("gpu_only")
 
+def _fp16(variant) -> bool:
+    return FULL_FP16 and variant.attention.backend is not None # keep baseline reference in fp32
 
 def atomic_json(obj: dict[str, Any], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -94,80 +100,6 @@ def set_nested_attribute(obj: Any, dotted: str, value: Any) -> None:
     setattr(current, parts[-1], value)
 
 
-def _cast_floating(value: Any, dtype: torch.dtype) -> Any:
-    if isinstance(value, torch.Tensor) and value.is_floating_point():
-        return value.to(dtype=dtype)
-    if isinstance(value, tuple):
-        return tuple(_cast_floating(x, dtype) for x in value)
-    if isinstance(value, list):
-        return [_cast_floating(x, dtype) for x in value]
-    if isinstance(value, dict):
-        return {k: _cast_floating(v, dtype) for k, v in value.items()}
-    return value
-
-
-def _first_float_dtype(value: Any) -> torch.dtype | None:
-    if isinstance(value, torch.Tensor) and value.is_floating_point():
-        return value.dtype
-    if isinstance(value, (tuple, list)):
-        for item in value:
-            found = _first_float_dtype(item)
-            if found is not None:
-                return found
-    if isinstance(value, dict):
-        for item in value.values():
-            found = _first_float_dtype(item)
-            if found is not None:
-                return found
-    return None
-
-
-class ExplicitPrecisionAdapter(torch.nn.Module):
-    """Wrap a submodule with deterministic, native (non-autocast) dtype edges."""
-    def __init__(self, inner: torch.nn.Module, dtype: torch.dtype, restore: bool):
-        super().__init__()
-        self.inner = inner.to(dtype=dtype)
-        self.target_dtype = dtype
-        self.restore = restore
-
-    def forward(self, *args, **kwargs):
-        original = _first_float_dtype((args, kwargs))
-        output = self.inner(*_cast_floating(args, self.target_dtype),
-                            **_cast_floating(kwargs, self.target_dtype))
-        if self.restore and original is not None:
-            output = _cast_floating(output, original)
-        return output
-
-
-def apply_precision_rules(model: torch.nn.Module, variant: Variant) -> torch.nn.Module:
-    if not variant.module_precision_rules:
-        return model
-    names = {name: module for name, module in model.named_modules() if name}
-    selected: dict[str, Any] = {}
-    for rule in variant.module_precision_rules:
-        matched = [name for name in names if fnmatchcase(name, rule.module_glob)]
-        if not matched:
-            raise ValueError(f"Module precision rule matched nothing: {rule.module_glob!r}")
-        for name in matched:
-            if name in selected:
-                raise ValueError(f"Multiple module precision rules target {name!r}")
-            selected[name] = rule
-    targets = sorted(selected)
-    for i, name in enumerate(targets):
-        if any(other.startswith(name + ".") for other in targets[i + 1:]):
-            raise ValueError(f"Overlapping nested module precision rules for {name!r}")
-    for name in targets:
-        parent_name, _, child_name = name.rpartition(".")
-        parent = names[parent_name] if parent_name else model
-        inner = parent._modules[child_name]
-        rule = selected[name]
-        parent._modules[child_name] = ExplicitPrecisionAdapter(
-            inner, dtype_of(rule.dtype), rule.restore_output_dtype)
-        print(f"  native mixed precision: {name} -> {rule.dtype} "
-              f"(restore={rule.restore_output_dtype})", flush=True)
-    return model
-
-
 def build_model(config: Any, state: dict, variant: Variant, device: torch.device,
                 partial: bool) -> torch.nn.Module:
     from mlpf.conf import AttentionType
@@ -176,22 +108,28 @@ def build_model(config: Any, state: dict, variant: Variant, device: torch.device
     cfg = config.model_copy(deep=True)
     attn = cfg.model.attention
     spec = variant.attention
-    if spec.varlen and (not spec.jagged or spec.implementation != "FLASH"):
-        raise ValueError(f"{variant.name}: varlen requires FLASH + jagged")
-    try:
-        attn.attention_type = getattr(AttentionType, spec.implementation)
-    except AttributeError as exc:
-        raise ValueError(f"No AttentionType.{spec.implementation} in this MLPF checkout") from exc
+    if spec.backend is not None and (not spec.varlen or not spec.jagged):
+        raise ValueError(f"{variant.name}: external FlashAttention requires native varlen + jagged")
+    if spec.backend is None and (spec.varlen or spec.jagged):
+        raise ValueError(f"{variant.name}: reference path must be dense, padded and masked")
+    if spec.backend is None and spec.kernel_dtype != "float32":
+        raise ValueError("FP32 reference must use FP32 attention")
+    if spec.backend is None and spec.sdpa_backend != "efficient":
+        raise ValueError("Only the golden FP32 memory-efficient SDPA reference is supported")
+    if spec.backend is not None and spec.sdpa_backend is not None:
+        raise ValueError("External FlashAttention and PyTorch SDPA backend must not overlap")
+    if spec.implementation != "SIMPLE":
+        raise ValueError("This benchmark uses SIMPLE PyTorch reference or external FlashAttention only")
+    attn.attention_type = AttentionType.SIMPLE
     attn.export_onnx_fused = False
     attn.save_attention = False
-    if spec.jagged and not hasattr(attn, "use_jagged_attention"):
+    if not hasattr(attn, "use_jagged_attention"):
         raise RuntimeError("This MLPF checkout lacks attention.use_jagged_attention")
-    if hasattr(attn, "use_jagged_attention"):
-        attn.use_jagged_attention = spec.jagged
-    if spec.varlen and not hasattr(attn, "use_flash_attn_varlen"):
-        raise RuntimeError("This MLPF checkout lacks attention.use_flash_attn_varlen")
+    attn.use_jagged_attention = spec.jagged
+    # Legacy config field may be present in old checkpoints; the new runtime
+    # dispatch ignores it. No config-file or orchestrator edits required.
     if hasattr(attn, "use_flash_attn_varlen"):
-        attn.use_flash_attn_varlen = spec.varlen
+        attn.use_flash_attn_varlen = False
     for key, value in variant.config_overrides.items():
         set_nested_attribute(cfg, key, value)
 
@@ -207,28 +145,178 @@ def build_model(config: Any, state: dict, variant: Variant, device: torch.device
     safe_state = {k: v for k, v in state.items() if k not in ignored}
     if ignored:
         print(f"{variant.name}: ignored inference-irrelevant checkpoint keys: {ignored}", flush=True)
+    low_checkpoint = [(name, str(t.dtype)) for name, t in safe_state.items()
+                      if isinstance(t, torch.Tensor) and t.is_floating_point()
+                      and t.dtype != torch.float32]
+    if low_checkpoint:
+        raise TypeError(f"Checkpoint weights must be FP32, not silently cast: {low_checkpoint[:12]}")
     incompat = model.load_state_dict(safe_state, strict=not partial)
     if partial and (incompat.missing_keys or incompat.unexpected_keys):
         print(f"WARNING: missing={incompat.missing_keys}, unexpected={incompat.unexpected_keys}", flush=True)
-    model = model.to(device=device, dtype=dtype_of(variant.precision.weights))
+    model = model.to(device=device, dtype=torch.float32)
     if variant.model_transform is not None:
         model = variant.model_transform(model)
     if not isinstance(model, torch.nn.Module):
         raise TypeError("model_transform must return a torch.nn.Module")
-    model = apply_precision_rules(model, variant)
+    if spec.backend is not None:
+        layer_count = model.configure_backbone_attention(spec.backend, spec.kernel_dtype)
+        print(f"  external {spec.backend} packed-varlen {spec.kernel_dtype}: "
+              f"{layer_count} backbone attention layers; all model weights FP32", flush=True)
+    if _fp16(variant):
+        model = model.half()
+    else:
+        verify_fp32_parameters(model)
     return model.eval()
+
+
+def verify_fp32_parameters(model: torch.nn.Module) -> dict:
+    """Fail if checkpoint weights, buffers or trainable layers are downcast."""
+    if FULL_FP16:
+        return {"status": "unchecked", "reason": "FP16 execution path is allowed"}
+    wrong = [(n, str(p.dtype)) for n, p in model.named_parameters()
+             if p.is_floating_point() and p.dtype != torch.float32]
+    wrong += [(n, str(b.dtype)) for n, b in model.named_buffers()
+              if b.is_floating_point() and b.dtype != torch.float32]
+    if wrong:
+        raise TypeError(f"All model floating weights/buffers must be FP32; unexpected: {wrong[:12]}")
+    return {"status": "verified", "floating_parameters": sum(p.numel() for p in model.parameters()
+                                                            if p.is_floating_point()),
+            "all_float32": True}
+
+
+def verify_fp32_layers(model, variant, input_dim, seq_len, device):
+    """Untimed eager preflight for linear/LN, residual, task readouts and heads."""
+    if _fp16(variant):
+        return {"status": "unchecked", "reason": "FP16 execution path is allowed"}
+    from mlpf.model.mlpf import PreLnSelfAttentionLayer, TaskQueryAttentionReadout, RegressionOutput
+    issues = []
+    inspected = {"linear": 0, "layernorm": 0, "backbone": 0, "readout": 0, "regression": 0}
+    handles = []
+
+    def check_values(name, value, place):
+        if hasattr(value, "values") and hasattr(value, "cu_seqlens"):
+            value = value.values
+        if isinstance(value, (list, tuple)):
+            for v in value:
+                check_values(name, v, place)
+        elif isinstance(value, torch.Tensor) and value.is_floating_point() and value.dtype != torch.float32:
+            issues.append(f"{name} {place} is {value.dtype}, expected float32")
+
+    for name, module in model.named_modules():
+        category = None
+        if isinstance(module, torch.nn.Linear):
+            category = "linear"
+        elif isinstance(module, torch.nn.LayerNorm):
+            category = "layernorm"
+        elif isinstance(module, PreLnSelfAttentionLayer):
+            category = "backbone"
+        elif isinstance(module, TaskQueryAttentionReadout):
+            category = "readout"
+        elif isinstance(module, RegressionOutput):
+            category = "regression"
+        if category is None:
+            continue
+        inspected[category] += 1
+        def pre(mod, args, name=name):
+            check_values(name, args, "input")
+        def post(mod, args, out, name=name):
+            check_values(name, out, "output")
+        handles.append(module.register_forward_pre_hook(pre))
+        handles.append(module.register_forward_hook(post))
+    try:
+        shape = (3, max(seq_len, 3), input_dim)
+        x, mask = synthetic_batch(shape, variant, device,
+                                   lengths=[shape[1], max(2, shape[1] // 2), 1])
+        with torch.inference_mode():
+            pred = forward(model, variant, x, mask)
+            validate_predictions_fp32(pred, mask, variant.name)
+            torch.cuda.synchronize(device)
+    finally:
+        for handle in handles:
+            handle.remove()
+    if issues:
+        raise TypeError("FP32 execution-path validation failed: " + "; ".join(issues[:12]))
+    if inspected["backbone"] == 0 or inspected["linear"] == 0 or inspected["layernorm"] == 0:
+        raise RuntimeError(f"Did not inspect required backbone/linear/norm layers: {inspected}")
+    return {"status": "verified", "modules_checked": inspected, "all_float32": True}
+
+
+def validate_predictions_fp32(out, mask, variant_name):
+    if FULL_FP16:
+        return {"status": "unchecked", "reason": "FP16 execution path is allowed"}
+
+    if not isinstance(out, (tuple, list)) or len(out) < 4:
+        raise TypeError(f"{variant_name}: model must return (bid, id, momentum, pu, ...)")
+    for index, tensor in enumerate(out):
+        if not isinstance(tensor, torch.Tensor):
+            continue
+        if tensor.is_floating_point() and tensor.dtype != torch.float32:
+            raise TypeError(f"{variant_name}: model output {index} is {tensor.dtype}, not FP32")
+        if tuple(tensor.shape[:2]) != tuple(mask.shape):
+            if index in HEADS.values():
+                raise ValueError(f"{variant_name}: output {index} event/sequence boundaries differ from input")
+        if not torch.isfinite(tensor).all():
+            raise ValueError(f"{variant_name}: model output {index} has nonfinite predictions")
+
+
+def verify_packed_offsets(mask, backend):
+    """One-time synchronization-based check of exact per-event boundaries."""
+    from mlpf.model.mlpf import dense_to_jagged, jagged_to_dense
+    if mask.ndim != 2 or mask.dtype != torch.bool:
+        raise ValueError("Varlen validation requires (B,S) bool mask")
+    d = torch.arange(mask.numel(), device=mask.device, dtype=torch.float32).reshape(*mask.shape, 1)
+    packed = dense_to_jagged(d, mask)
+    lengths = mask.sum(-1, dtype=torch.int64)
+    expected = torch.nn.functional.pad(lengths.cumsum(0), (1, 0))
+    if (not torch.equal(packed.cu_seqlens.to(torch.int64), expected) or
+            (lengths == 0).any() or packed.values.shape[0] != int(lengths.sum()) or
+            packed.cu_seqlens.dtype != torch.int32 or
+            not torch.equal(jagged_to_dense(packed, mask)[mask], d[mask])):
+        raise RuntimeError(f"{backend}: invalid native-varlen offsets or pack/unpack event boundaries")
+    return {"status": "verified", "event_lengths": lengths.cpu().tolist(),
+            "cu_seqlens": expected.cpu().tolist(), "total_valid_tokens": packed.values.shape[0]}
+
+
+def verify_external_kernel_event_isolation(variant, device, num_heads, head_dim):
+    """Untimed real-kernel test: modifying event 2 must not change events 1/3.
+
+    This detects an implementation that erroneously attends across cu_seqlens
+    boundaries. Uses the exact selected backend and numerical dtype (not SDPA).
+    """
+    if FULL_FP16:
+        return {"status": "unchecked", "reason": "FP16 execution path is allowed"}
+    if variant.attention.backend is None:
+        return None
+    from attention_backends import run_packed_attention
+    generator = torch.Generator(device=device).manual_seed(1729)
+    lengths = (7, 3, 11)
+    offsets = torch.tensor((0, 7, 10, 21), dtype=torch.int32, device=device)
+    with torch.inference_mode():
+        q, k, v = (torch.randn((21, num_heads, head_dim), dtype=torch.float32,
+                                device=device, generator=generator) for _ in range(3))
+        original = run_packed_attention(variant.attention.backend,
+                                        variant.attention.kernel_dtype,
+                                        q, k, v, offsets, offsets, 11, 11)
+        modified_k = k.clone()
+        modified_v = v.clone()
+        modified_k[7:10] += 32.0
+        modified_v[7:10] *= -8.0
+        changed = run_packed_attention(variant.attention.backend,
+                                       variant.attention.kernel_dtype,
+                                       q, modified_k, modified_v, offsets, offsets, 11, 11)
+        if (not torch.isfinite(original).all() or not torch.isfinite(changed).all()
+                or not torch.allclose(original[:7], changed[:7], atol=1e-5, rtol=1e-5)
+                or not torch.allclose(original[10:], changed[10:], atol=1e-5, rtol=1e-5)):
+            raise RuntimeError(f"{variant.name}: packed varlen kernel crossed event boundaries")
+    return {"status": "verified", "event_lengths": list(lengths),
+            "modified_event": 1, "unmodified_events_unchanged": True}
 
 
 def attention_context(variant: Variant):
     name = variant.attention.sdpa_backend
     if name is None:
         return nullcontext()
-    mapping = {
-        "math": SDPBackend.MATH,
-        "flash": SDPBackend.FLASH_ATTENTION,
-        "efficient": SDPBackend.EFFICIENT_ATTENTION,
-        "cudnn": getattr(SDPBackend, "CUDNN_ATTENTION", None),
-    }
+    mapping = {"efficient": SDPBackend.EFFICIENT_ATTENTION}
     if name not in mapping or mapping[name] is None:
         raise ValueError(f"SDPA backend {name!r} unsupported by this PyTorch build")
     return sdpa_kernel(mapping[name])  # Enforce only this SDPA backend; never silently fall back.
@@ -236,6 +324,10 @@ def attention_context(variant: Variant):
 
 def forward(model: torch.nn.Module, variant: Variant, x: torch.Tensor,
             mask: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    if mask.dtype != torch.bool:
+        raise TypeError(f"{variant.name}: benchmark requires bool mask")
+    if _fp16(variant):
+        x = x.to(torch.float16)
     with attention_context(variant):
         out = (variant.forward_fn(model, x, mask) if variant.forward_fn is not None
                else model(x, mask))
@@ -313,13 +405,7 @@ def make_batches(events: list[torch.Tensor], b: int, multiple: int,
 def host_batches(batches, variant: Variant, pinned: bool):
     out = []
     for x, m, batch_ids in batches:
-        input_dtype = dtype_of(variant.precision.input_dtype)
-        if input_dtype == torch.float16 and torch.any(x.abs() > torch.finfo(torch.float16).max):
-            raise ValueError(
-                "Dataset contains features outside FP16 representable range. "
-                "Use BF16, explicit feature normalization, or --input-clip (which alters data)."
-            )
-        x, m = x.to(input_dtype).contiguous(), m.contiguous()
+        x, m = x.to(torch.float32).contiguous(), m.contiguous()
         if variant.input_transform is not None:
             x, m = variant.input_transform(x, m)
             if x.device.type != "cpu" or m.device.type != "cpu":
@@ -340,7 +426,7 @@ def synthetic_batch(shape, variant: Variant, device: torch.device, lengths=None)
     # different dispatch-key set from tensors created outside inference_mode().
     # Mixing these was a cause of unnecessary torch.compile recompilation.
     with torch.inference_mode():
-        x = torch.randn((b, seq_len, d), dtype=dtype_of(variant.precision.input_dtype), device=device)
+        x = torch.randn((b, seq_len, d), dtype=torch.float32, device=device)
         mask = torch.zeros((b, seq_len), device=device, dtype=torch.bool)
         if lengths is None:
             lengths = [max(1, int(seq_len * (0.85 - 0.05 * (i % 3)))) for i in range(b)]
@@ -437,19 +523,23 @@ def verify_dispatch(model, variant, input_dim: int, seq_len: int, device,
     if not patterns:
         return {"status": "unchecked", "reason": "No expected_ops supplied"}
     if variant.attention.varlen and seq_len < 3:
-        raise ValueError("Varlen verification needs synthetic sequence length >= 3")
+        seq_len = 3  # The independent B=3 uneven-length dispatch probe.
     shape = ((3 if variant.attention.varlen else 1), seq_len, input_dim)
     lengths = ([seq_len, max(2, seq_len // 2), 1]
                if variant.attention.varlen else None)
     # Use a verification-specific B=3 mask to prove segmented varlen dispatch.
     from torch.profiler import ProfilerActivity, profile
     x, mask = synthetic_batch(shape, variant, device, lengths=lengths)
+    packed_validation = (verify_packed_offsets(mask, variant.attention.backend)
+                         if variant.attention.backend is not None else None)
     with torch.inference_mode():
-        forward(model, variant, x, mask)
+        pred = forward(model, variant, x, mask)
+        validate_predictions_fp32(pred, mask, variant.name)
         torch.cuda.synchronize(device)
         with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
                      acc_events=True) as prof:
-            forward(model, variant, x, mask)
+            pred = forward(model, variant, x, mask)
+            validate_predictions_fp32(pred, mask, variant.name)
             torch.cuda.synchronize(device)
     keys = profiler_keys(prof)
     observed = [k for k in keys if any(re.search(regex, k, flags=re.I)
@@ -459,9 +549,30 @@ def verify_dispatch(model, variant, input_dim: int, seq_len: int, device,
         raise RuntimeError(
             f"{variant.name}: no required kernel op {patterns} on synthetic "
             f"shape {shape}. Nearby profiler ops: {nearby[:30]}. No SDPA fallback accepted.")
+    cuda_names = sorted({e.name for e in prof.events()
+                         if "CUDA" in str(getattr(e, "device_type", "")).upper()})
+    external = variant.attention.backend is not None
+    if external:
+        # Actual launched GPU attention kernel (not only CPU record_function).
+        # These external implementations name their CUDA kernel with flash/fmha
+        # or CuTe; assert a kernel launch rather than accepting only the scope.
+        flash_kernels = [name for name in cuda_names if re.search(
+            r"flash|fmha|cute|cutlass.*attn|attention.*fwd", name, re.I)]
+        if not flash_kernels:
+            raise RuntimeError(
+                f"{variant.name}: external {variant.attention.backend} scope executed, "
+                f"but no identifiable CUDA attention kernel launched. CUDA sample: {cuda_names[:25]}")
+        if any(re.search(r"scaled_dot_product_flash_attention|efficient_attention_forward", k, re.I)
+               for k in keys):
+            raise RuntimeError(f"{variant.name}: unexpected PyTorch SDPA flash/efficient op with external backend")
+    else:
+        flash_kernels = []
     del x, mask
-    return {"status": "verified", "matched_ops": observed, "verification_shape": list(shape),
-            "unequal_lengths": lengths}
+    return {"status": "verified", "matched_ops": observed,
+            "matched_cuda_kernels": flash_kernels[:25],
+            "cuda_kernels_sample": cuda_names[:25],
+            "packed_boundaries": packed_validation,
+            "verification_shape": list(shape), "unequal_lengths": lengths}
 
 
 def warmup(model, variant, shape, device, iterations):
@@ -914,6 +1025,8 @@ def accuracy(model, variant, batches, reference, device, pinned,
             del x, mask, out
     total = sum(counts.values())
     has_invalid = any(invalid.values())
+    if has_invalid:
+        raise ValueError(f"{variant.name}: nonfinite accuracy predictions: {invalid}")
     macro = [row["mae"] for row in per_event if row["mae"] is not None]
     per_event.sort(key=lambda row: row["event_id"])
     return {
@@ -955,29 +1068,41 @@ def run_job(job: dict[str, Any], variant_name: str, output: Path):
     # Shape-changing data cause cuDNN to autotune repeatedly when enabled.
     # Keep off unless user wants that explicit throughput trade-off.
     torch.backends.cudnn.benchmark = settings.get("cudnn_benchmark", False)
-    if any(dt == "bfloat16" for dt in (variant.precision.weights, variant.precision.input_dtype)):
-        if not torch.cuda.is_bf16_supported():
-            raise RuntimeError("BF16 variant requested, but GPU does not support BF16")
+    if is_reference and variant.name != "fp32_efficient":
+        raise RuntimeError("The only golden reference is fp32_efficient")
+    if variant.name == "fp32_efficient" and not is_reference:
+        raise ValueError("fp32_efficient must be run as the golden reference, not a timed variant")
+    if variant.attention.backend is None and (variant.compile or settings["compile"]):
+        # Golden reference must never be compiled, irrespective of CLI setting.
+        if is_reference:
+            print("[WORKER] golden FP32 reference is never compiled", flush=True)
 
     print(f"[WORKER] {variant_name} | PID={os.getpid()} | {torch.cuda.get_device_name(device)}",
           flush=True)
     config, state, multiple = load_config_and_state(settings)
     events = load_events(settings, config.input_dim)
     input_fingerprint = event_fingerprint(events)
+    from attention_backends import validate_backend
+    backend_validation = ({"status": "skipped (FULL_FP16)"} if FULL_FP16 and variant.attention.backend is not None
+                        else validate_backend(variant.attention.backend,
+                                            variant.attention.kernel_dtype, device,
+                                            int(config.model.attention.head_dim))
+                        if variant.attention.backend is not None else
+                        {"status": "fp32_efficient", "native_varlen": False})
     model = build_model(config, state, variant, device, settings["allow_partial_state"])
+    parameter_validation = verify_fp32_parameters(model)
+    event_isolation_validation = verify_external_kernel_event_isolation(
+        variant, device, int(config.model.attention.num_heads),
+        int(config.model.attention.head_dim))
     del state
     warm_len = settings["warmup_seq_len"]
     if multiple:
         warm_len = (warm_len + multiple - 1) // multiple * multiple
     shape = (1, warm_len, config.input_dim)
-    verification = (
-        verify_dispatch(model, variant, config.input_dim, warm_len, device)
-        if settings["profile"]
-        else {
-            "status": "unchecked",
-            "reason": "PyTorch profiler disabled"
-        }
-    )
+    dtype_validation = verify_fp32_layers(model, variant, config.input_dim, warm_len, device)
+    # Verification is mandatory for every variant, even when optional detailed
+    # per-batch profiling and Chrome traces are disabled.
+    verification = verify_dispatch(model, variant, config.input_dim, warm_len, device)
     # Initialize eager libraries BEFORE compilation. Do not compile a synthetic
     # 256-token B=1 graph that the actual dataset never uses.
     warmup(model, variant, shape, device, settings["warmup_iters"])
@@ -1007,6 +1132,10 @@ def run_job(job: dict[str, Any], variant_name: str, output: Path):
         "variant_spec": variant.describe(), "system": sysinfo,
         "dispatch_verification": verification,
         "compiled_dispatch_verification": compiled_verification,
+        "backend_validation": backend_validation,
+        "fp32_parameter_validation": parameter_validation,
+        "fp32_execution_validation": dtype_validation,
+        "event_isolation_validation": event_isolation_validation,
         "compiled": compiled, "compile_mode": compile_mode if compiled else None,
         "compile_dynamic": settings.get("compile_dynamic", "auto") if compiled else None,
         "pad_multiple": multiple,
@@ -1121,7 +1250,7 @@ def run_job(job: dict[str, Any], variant_name: str, output: Path):
                 del batches
             # Profiling and its extra graph specializations must NOT interfere
             # with the timed sweeps. Defer all profiler work until the end.
-            if compiled and settings["profile"]:
+            if compiled:
                 compiled_patterns = (variant.attention.compiled_expected_ops
                                      if variant.attention.compiled_expected_ops is not None
                                      else variant.attention.expected_ops)
@@ -1129,6 +1258,10 @@ def run_job(job: dict[str, Any], variant_name: str, output: Path):
                     model, variant, config.input_dim, warm_len, device,
                     compiled_patterns)
                 result["compiled_dispatch_verification"] = compiled_verification
+                if compiled_graph_count() == 0:
+                    raise RuntimeError(f"{variant_name}: torch.compile produced zero graphs; "
+                                       "compiled variant is not actually compiled")
+                atomic_json(result, output)
             if settings["profile"]:
                 for b in settings["batch_sizes"]:
                     print(f"[WORKER] {variant_name} B={b} | untimed real-batch profile", flush=True)

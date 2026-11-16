@@ -37,6 +37,8 @@ CKPT="$FAST/colliderml/checkpoint-40000.pth"
 KWRGS="$FAST/colliderml/model_kwargs.pkl"
 
 DATA_DIR="$FAST/"
+export PYTHONPATH="$PWD:$PWD/scripts/benchmarking:${PYTHONPATH:-}"
+export PYTHONFAULTHANDLER=1
 
 uv run --project envs/ort-gpu --no-sync python scripts/benchmarking/benchmark_physics.py \
     --checkpoint $CKPT \
@@ -44,11 +46,11 @@ uv run --project envs/ort-gpu --no-sync python scripts/benchmarking/benchmark_ph
     --dataset dataset \
     --split test \
     --num-events 500 \
-    --outdir test_physics_large \
+    --outdir test_physics_large_with_reference_fullfp16\
     --model-kwargs $KWRGS \
     --allow-partial-state \
     --batch-size 8 \
     --pad-bin-size 8 \
     --compile-mode default \
-    --variants fp16_flash bf16_flash fp16_flash_compile bf16_flash_compile \
+    --variants flash_attention_2_fp16 flash_attention_2_bf16 \
     --compile-dynamic true
