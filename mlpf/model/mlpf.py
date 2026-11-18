@@ -19,11 +19,6 @@ from mlpf.model.hept import HEPTLayer, trunc_normal_
 from mlpf.model.heptv2 import HEPTv2Layer
 from mlpf.model.set_decoder import ParticleSetDecoder
 
-try:
-    from flash_attn import flash_attn_varlen_func as _flash_attn_varlen_func
-except (ImportError, OSError):
-    _flash_attn_varlen_func = None
-
 from mlpf.conf import (
     MLPFConfig,
     Activation,
@@ -37,13 +32,6 @@ from mlpf.conf import (
     KernelType,
     Dataset,
 )
-
-
-@torch.compiler.disable
-def _flash_attn_varlen_eager(*args, **kwargs):
-    # The ROCm FlashAttention custom op can return an auxiliary softmax_lse
-    # layout that disagrees with its fake registration under torch.compile.
-    return _flash_attn_varlen_func(*args, **kwargs)
 
 
 def get_activation(activation: Activation):
@@ -101,6 +89,8 @@ def is_jagged_tensor(tensor):
 # run with torch.compile and the native fused attention kernel, respectively.
 @torch.compiler.disable
 def dense_to_jagged(tensor, mask):
+    if mask.numel() >= 2**31:
+        raise ValueError("Packed native varlen requires fewer than 2**31 padded tokens (int32 offsets)")
     valid = mask.bool()
     valid_lengths = valid.sum(dim=-1)
     offsets = torch.nn.functional.pad(valid_lengths.cumsum(dim=0), (1, 0))
@@ -122,7 +112,6 @@ class SimpleMultiheadAttention(nn.MultiheadAttention):
         dtype=None,
         export_onnx_fused=False,
         attention_type: AttentionType = AttentionType.SIMPLE,
-        use_flash_attn_varlen=False,
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         bias = True
@@ -134,17 +123,13 @@ class SimpleMultiheadAttention(nn.MultiheadAttention):
         self.onnx_attention_dtype = None
         self.onnx_attention_format = None
         self.attention_type = AttentionType(attention_type)
-        self.use_flash_attn_varlen = use_flash_attn_varlen
-        if self.use_flash_attn_varlen and self.attention_type != AttentionType.FLASH:
-            raise ValueError("flash_attn_varlen requires attention_type='flash'")
-        if self.use_flash_attn_varlen and (self.head_dim < 8 or self.head_dim > 256 or self.head_dim % 8 != 0):
-            raise ValueError("flash_attn_varlen requires head_dim to be a multiple of 8 between 8 and 256")
-        if self.use_flash_attn_varlen and _flash_attn_varlen_func is None:
-            raise ImportError("use_flash_attn_varlen=True requires a compatible flash-attn installation " "that provides flash_attn_varlen_func")
+        # Non-persistent metadata: no new checkpoint keys or parameter casts.
+        # Set only for backbone MHA modules using configure_backbone_attention.
+        self.attention_backend = None
+        self.attention_kernel_dtype = None
         self.attn_params = {
             AttentionType.SIMPLE: [SDPBackend.MATH, SDPBackend.EFFICIENT_ATTENTION],
             AttentionType.MATH: [SDPBackend.MATH],
-            AttentionType.FLASH: [SDPBackend.FLASH_ATTENTION],
         }
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, need_weights=False, key_padding_mask=None) -> torch.Tensor:
@@ -156,8 +141,14 @@ class SimpleMultiheadAttention(nn.MultiheadAttention):
             raise ValueError("q, k, and v must all use the same dense or jagged layout")
         if jagged_input and (key_padding_mask is not None or export_path):
             raise ValueError("Jagged attention does not use padding masks and cannot use the ONNX-fused path")
-        if self.use_flash_attn_varlen and not jagged_input:
-            raise ValueError("flash_attn_varlen_func requires packed jagged q, k, and v")
+        if (self.attention_backend is None) != (self.attention_kernel_dtype is None):
+            raise RuntimeError("External backend and attention kernel dtype must be configured together")
+        if self.attention_backend is not None and not jagged_input:
+            raise ValueError("External FlashAttention MUST receive packed variable-length Q/K/V")
+        if jagged_input and self.attention_backend is None:
+            raise ValueError("Jagged backbone attention is supported only by explicit external varlen kernels")
+        if self.attention_backend is None and self.attention_type == AttentionType.FLASH:
+            raise ValueError("PyTorch SDPA Flash is disabled for this benchmark; select an external backend")
 
         if jagged_input:
             bs = q.batch_size
@@ -176,55 +167,43 @@ class SimpleMultiheadAttention(nn.MultiheadAttention):
         q_values = torch.matmul(q_values, wq.T)
         k_values = torch.matmul(k_values, wk.T)
         v_values = torch.matmul(v_values, wv.T)
-        # ROCm Inductor 2.7 can fuse autocast matmul+bias into addmm without
-        # casting the FP32 bias. Cast to the actual matmul output dtype first.
+        # The projection and all bias additions are FP32 for every variant.
         q_values = q_values + bq.to(q_values.dtype)
         k_values = k_values + bk.to(k_values.dtype)
         v_values = v_values + bv.to(v_values.dtype)
 
-        # for pytorch internal scaled dot product attention, we need (bs, num_heads, seq_len, head_dim)
-        if jagged_input and self.use_flash_attn_varlen:
+        # FA2/FA3/FA4: packed (total_valid_tokens, heads, head_dim).
+        # Dense reference: PyTorch SDPA (batch, heads, padded_seq_len, head_dim).
+        if jagged_input:
             q_attn = q_values.reshape(-1, num_heads, head_dim)
             k_attn = k_values.reshape(-1, num_heads, head_dim)
             v_attn = v_values.reshape(-1, num_heads, head_dim)
-        elif jagged_input:
-            nested_qkv = []
-            for tensor in (q_values, k_values, v_values):
-                nested = torch.nested.nested_tensor_from_jagged(
-                    tensor.reshape(-1, num_heads, head_dim),
-                    q.offsets,
-                    min_seqlen=1,
-                    max_seqlen=q.max_seqlen,
-                )
-                nested_qkv.append(nested.transpose(1, 2))
-            q_attn, k_attn, v_attn = nested_qkv
         else:
             q_attn = q_values.reshape(bs, -1, num_heads, head_dim).transpose(1, 2)
             k_attn = k_values.reshape(bs, -1, num_heads, head_dim).transpose(1, 2)
             v_attn = v_values.reshape(bs, -1, num_heads, head_dim).transpose(1, 2)
-        # Dense flash SDPA does not accept a non-null mask. Callers that need
-        # correct variable-length flash attention must pass jagged q/k/v.
+        # Golden reference preserves the original dense key-padding mask.
         attn_mask = None
         if key_padding_mask is not None:
             # key_padding_mask: [bs, seq_len], True where elements are to be ignored
             # scaled_dot_product_attention expects attn_mask: [bs, 1, 1, seq_len], False where elements are to be ignored
-            if self.attention_type == AttentionType.FLASH and not export_path:
-                raise ValueError("Dense flash attention cannot use key_padding_mask; enable jagged attention")
-            else:
-                attn_mask = ~key_padding_mask.view(bs, 1, 1, k_len)
+            attn_mask = ~key_padding_mask.view(bs, 1, 1, k_len)
 
-        if self.use_flash_attn_varlen:
-            flash_attn_varlen = _flash_attn_varlen_eager if torch.version.hip is not None else _flash_attn_varlen_func
-            attn_output = flash_attn_varlen(
-                q_attn,
-                k_attn,
-                v_attn,
-                q.cu_seqlens,
-                k.cu_seqlens,
-                q.max_seqlen,
-                k.max_seqlen,
-                dropout_p=self.dropout if self.training else 0.0,
-                causal=False,
+        if self.attention_backend is not None:
+            # Q/K/V must be the same set of self-attention events; no cross-event
+            # mixing or dense/padded attention is allowed.
+            if (q.cu_seqlens is not k.cu_seqlens or
+                    q.cu_seqlens is not v.cu_seqlens or
+                    q.batch_size != k.batch_size or q.batch_size != v.batch_size):
+                raise ValueError("Backbone self-attention Q/K/V must share packed event boundaries")
+            if self.training:
+                raise RuntimeError("External attention benchmark backends are inference-only")
+            from attention_backends import run_packed_attention
+
+            attn_output = run_packed_attention(
+                self.attention_backend, self.attention_kernel_dtype,
+                q_attn, k_attn, v_attn, q.cu_seqlens, k.cu_seqlens,
+                q.max_seqlen, k.max_seqlen,
             )
         elif export_path:
             if self.onnx_attention_dtype is not None:
@@ -245,15 +224,12 @@ class SimpleMultiheadAttention(nn.MultiheadAttention):
                     q_attn, k_attn, v_attn, attn_mask=attn_mask, dropout_p=self.dropout if self.training else 0.0
                 )
 
-        # Keep residual paths type-stable for half-precision ONNX export.
+        # External attention has already restored FP32 before out_proj.
+        # For the dense golden path, retain the original output cast unchanged.
         attn_output = attn_output.to(q_values.dtype)
 
-        # in case running with pytorch internal scaled dot product attention, reshape back to the original shape
         if jagged_input:
-            if self.use_flash_attn_varlen:
-                attn_output = attn_output.reshape(-1, num_heads * head_dim)
-            else:
-                attn_output = attn_output.transpose(1, 2).values().reshape(-1, num_heads * head_dim)
+            attn_output = attn_output.reshape(-1, num_heads * head_dim)
         else:
             attn_output = attn_output.transpose(1, 2).reshape(bs, -1, num_heads * head_dim)
 
@@ -280,7 +256,6 @@ class PreLnSelfAttentionLayer(nn.Module):
         elems_as_queries=False,
         export_onnx_fused=False,
         save_attention=False,
-        use_flash_attn_varlen=False,
     ):
         super(PreLnSelfAttentionLayer, self).__init__()
         self.name = name
@@ -295,7 +270,6 @@ class PreLnSelfAttentionLayer(nn.Module):
             dropout=dropout_mha,
             export_onnx_fused=export_onnx_fused,
             attention_type=self.attention_type,
-            use_flash_attn_varlen=use_flash_attn_varlen,
         )
 
         self.norm0 = torch.nn.LayerNorm(embedding_dim)
@@ -1183,7 +1157,6 @@ class MLPF(nn.Module):
         self.backbone_mode = BackboneMode(self.config.backbone.mode)
         self.use_split_backbone = self.backbone_mode == BackboneMode.SPLIT
         self.use_jagged_attention = False
-        self.use_flash_attn_varlen = False
         regression_selector_values = self.elemtypes_nonzero
         pt_mode = RegressionMode(self.config.pt_mode)
         eta_mode = RegressionMode(self.config.eta_mode)
@@ -1231,15 +1204,10 @@ class MLPF(nn.Module):
             self.use_jagged_attention = sub_config.use_jagged_attention or (
                 attention_type == AttentionType.FLASH and not sub_config.export_onnx_fused
             )
-            self.use_flash_attn_varlen = sub_config.use_flash_attn_varlen
             export_onnx_fused = sub_config.export_onnx_fused
             save_attention = sub_config.save_attention
             if self.use_jagged_attention and export_onnx_fused:
                 raise ValueError("Jagged attention is not supported by the ONNX-fused path")
-            if self.use_flash_attn_varlen and not self.use_jagged_attention:
-                raise ValueError("flash_attn_varlen requires use_jagged_attention=True to pack the backbone input")
-            if self.use_flash_attn_varlen and attention_type != AttentionType.FLASH:
-                raise ValueError("flash_attn_varlen requires attention_type='flash'")
             if self.use_jagged_attention and attention_type == AttentionType.FLASH and (head_dim < 8 or head_dim > 256 or head_dim % 8 != 0):
                 raise ValueError("Jagged flash attention requires head_dim to be a multiple of 8 between 8 and 256")
 
@@ -1345,7 +1313,6 @@ class MLPF(nn.Module):
                 "num_heads": num_heads if self.conv_type in [ModelType.ATTENTION, ModelType.HEPT, ModelType.HEPTV2] else None,
                 "attention_type": attention_type if self.conv_type == ModelType.ATTENTION else None,
                 "export_onnx_fused": export_onnx_fused if self.conv_type == ModelType.ATTENTION else False,
-                "use_flash_attn_varlen": self.use_flash_attn_varlen if self.conv_type == ModelType.ATTENTION else False,
                 "save_attention": save_attention if self.conv_type == ModelType.ATTENTION else False,
                 "pos": pos if self.conv_type == ModelType.HEPT else False,
                 "layer_params": {
@@ -1466,7 +1433,6 @@ class MLPF(nn.Module):
 
         _logger.info("backbone_mode={}".format(self.backbone_mode))
         _logger.info("jagged_attention enabled={}".format(self.use_jagged_attention))
-        _logger.info("flash_attn_varlen enabled={}".format(self.use_flash_attn_varlen))
         _logger.info("task_queries enabled={}".format(self.task_queries and not self.use_split_backbone))
         _logger.info(
             "classification_norm parameters: {}".format(count_parameters(self.classification_norm) if self.classification_norm is not None else 0)
@@ -1510,7 +1476,6 @@ class MLPF(nn.Module):
         num_heads=None,
         attention_type=None,
         export_onnx_fused=False,
-        use_flash_attn_varlen=False,
         save_attention=False,
         pos=False,
         layer_params=None,
@@ -1531,7 +1496,6 @@ class MLPF(nn.Module):
                     num_heads=num_heads,
                     attention_type=attention_type,
                     export_onnx_fused=export_onnx_fused,
-                    use_flash_attn_varlen=use_flash_attn_varlen,
                     save_attention=save_attention,
                     pos=pos,
                     layer_params=layer_params,
@@ -1551,7 +1515,6 @@ class MLPF(nn.Module):
         num_heads=None,
         attention_type=None,
         export_onnx_fused=False,
-        use_flash_attn_varlen=False,
         save_attention=False,
         pos=False,
         layer_params=None,
@@ -1569,7 +1532,6 @@ class MLPF(nn.Module):
                 attention_type=attention_type,
                 elems_as_queries=is_last,
                 export_onnx_fused=export_onnx_fused,
-                use_flash_attn_varlen=use_flash_attn_varlen,
                 save_attention=save_attention,
             )
         if self.conv_type == ModelType.GNNLSH:
@@ -1674,6 +1636,27 @@ class MLPF(nn.Module):
                 x = conv(x, mask, initial_embedding)
             embeddings.append(x)
         return embeddings
+
+    def configure_backbone_attention(self, backend: str, kernel_dtype: str) -> int:
+        """Select external packed-varlen SDPA only for backbone MHA instances.
+
+        Changes only Python attributes, not parameters/buffers or state_dict keys.
+        Does not touch classification/regression task-query readout attention.
+        """
+        if self.conv_type != ModelType.ATTENTION or not self.use_jagged_attention:
+            raise ValueError("External varlen attention requires an ATTENTION model with jagged packing")
+        count = 0
+        for layers in (self.backbone, self.tracker_backbone, self.calo_backbone,
+                       getattr(self, "_backbone_id", ()), getattr(self, "_backbone_reg", ())):
+            for layer in layers:
+                if not isinstance(layer, PreLnSelfAttentionLayer):
+                    raise TypeError("External benchmark backend supports only PreLnSelfAttentionLayer backbones")
+                layer.mha.attention_backend = backend
+                layer.mha.attention_kernel_dtype = kernel_dtype
+                count += 1
+        if count == 0:
+            raise RuntimeError("No backbone attention layers to benchmark")
+        return count
 
     def _prepare_backbone_input(self, x, mask):
         if self.use_jagged_attention:
