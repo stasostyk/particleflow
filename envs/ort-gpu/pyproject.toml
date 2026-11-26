@@ -5,6 +5,7 @@ requires-python = "==3.11.*"
 dependencies = [
     "particleflow",
     "onnxruntime-gpu==1.29.0",
+    "flash-attn-3>=3.0.0b1",
 ]
 
 [tool.uv.sources]
@@ -12,6 +13,11 @@ particleflow = { path = "../.." }
 
 # PyPI versions >=1.27 use CUDA 13. Resolve only ORT from the CUDA 12 feed.
 onnxruntime-gpu = { index = "ort-cuda12" }
+flash-attn-3 = { index = "astral-cu128" }
+
+[[tool.uv.index]]
+name = "astral-cu128"
+url = "https://wheels.astral.sh/simple/cu128/"
 
 [[tool.uv.index]]
 name = "ort-cuda12"

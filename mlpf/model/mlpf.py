@@ -127,6 +127,8 @@ class SimpleMultiheadAttention(nn.MultiheadAttention):
         # Set only for backbone MHA modules using configure_backbone_attention.
         self.attention_backend = None
         self.attention_kernel_dtype = None
+        # FP8 only: static per-head scales set by attention_backends.calibrate_fp8_scales.
+        self.attention_fp8_scales = None
         self.attn_params = {
             AttentionType.SIMPLE: [SDPBackend.MATH, SDPBackend.EFFICIENT_ATTENTION],
             AttentionType.MATH: [SDPBackend.MATH],
@@ -203,7 +205,7 @@ class SimpleMultiheadAttention(nn.MultiheadAttention):
             attn_output = run_packed_attention(
                 self.attention_backend, self.attention_kernel_dtype,
                 q_attn, k_attn, v_attn, q.cu_seqlens, k.cu_seqlens,
-                q.max_seqlen, k.max_seqlen,
+                q.max_seqlen, k.max_seqlen, fp8_scales=self.attention_fp8_scales,
             )
         elif export_path:
             if self.onnx_attention_dtype is not None:

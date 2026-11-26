@@ -46,7 +46,9 @@ MIB = 1024 * 1024
 
 HEADS = {"id": 1, "momentum": 2, "pu": 3}
 MODES = ("e2e", "gpu_only")
-FULL_FP16 = True
+# False: only the external attention kernel runs in low precision; the rest
+# of the model stays FP32. True: whole model in FP16 (all checks skipped).
+FULL_FP16 = False
 # MODES = ("gpu_only")
 
 def _fp16(variant) -> bool:
@@ -336,6 +338,47 @@ def forward(model: torch.nn.Module, variant: Variant, x: torch.Tensor,
     return tuple(out)
 
 
+FP8_DTYPE = "float8_e4m3fn"
+FP8_CALIBRATION_EVENTS = 32   # Dataset events used to calibrate static FP8 scales
+FP8_CALIBRATION_MARGIN = 1.0  # Scale headroom: >1 leaves room for unseen larger values
+
+
+def prepare_fp8(model, variant: Variant, calibration_inputs, device) -> dict | None:
+    """Untimed FP8 setup before verification/compilation; no-op for other dtypes.
+
+    1. Optionally fold a per-head Hadamard rotation into the projection weights.
+    2. For fp8_scaling == "static", run eager forwards on `calibration_inputs`
+       (iterable of CUDA (x, mask) pairs) and freeze per-layer, per-head scales.
+    Must run on the EAGER model, before torch.compile.
+    """
+    spec = variant.attention
+    if spec.kernel_dtype != FP8_DTYPE:
+        return None
+    from attention_backends import apply_hadamard_rotation, calibrate_fp8_scales
+    report: dict[str, Any] = {"scaling": spec.fp8_scaling, "hadamard": spec.fp8_hadamard}
+    if spec.fp8_hadamard:
+        report["rotated_layers"] = apply_hadamard_rotation(model)
+    if spec.fp8_scaling == "static":
+        seen = 0
+
+        def run():
+            nonlocal seen
+            with torch.inference_mode():
+                for x, mask in calibration_inputs:
+                    forward(model, variant, x, mask)
+                    seen += 1
+            torch.cuda.synchronize(device)
+
+        report["calibration"] = calibrate_fp8_scales(model, run, FP8_CALIBRATION_MARGIN)
+        report["calibration_events"] = seen
+    print(f"  FP8 setup: scaling={spec.fp8_scaling}, hadamard={spec.fp8_hadamard}"
+          + (f", rotated {report['rotated_layers']} layers" if spec.fp8_hadamard else "")
+          + (f", calibrated {report['calibration']['layers']} layers on "
+             f"{report['calibration_events']} events" if spec.fp8_scaling == "static" else ""),
+          flush=True)
+    return report
+
+
 def load_events(settings: dict[str, Any], feature_dim: int) -> list[torch.Tensor]:
     import tensorflow_datasets as tfds
 
@@ -532,16 +575,55 @@ def verify_dispatch(model, variant, input_dim: int, seq_len: int, device,
     x, mask = synthetic_batch(shape, variant, device, lengths=lengths)
     packed_validation = (verify_packed_offsets(mask, variant.attention.backend)
                          if variant.attention.backend is not None else None)
+    
+    # Warm up the CUDA profiler independently of model warmup.
+    # On GH200, the first CUPTI profiling session may
+    # report CPU scopes but no CUDA kernel events.
     with torch.inference_mode():
         pred = forward(model, variant, x, mask)
         validate_predictions_fp32(pred, mask, variant.name)
         torch.cuda.synchronize(device)
-        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                     acc_events=True) as prof:
-            pred = forward(model, variant, x, mask)
-            validate_predictions_fp32(pred, mask, variant.name)
-            torch.cuda.synchronize(device)
+
+        max_profile_attempts = 3
+
+        for attempt in range(max_profile_attempts):
+            with profile(
+                activities=[
+                    ProfilerActivity.CPU,
+                    ProfilerActivity.CUDA,
+                ],
+                acc_events=True,
+            ) as prof:
+                pred = forward(model, variant, x, mask)
+                validate_predictions_fp32(
+                    pred, mask, variant.name
+                )
+                torch.cuda.synchronize(device)
+
+            cuda_events = [
+                e for e in prof.events()
+                if e.device_type == torch.autograd.DeviceType.CUDA
+            ]
+
+            if cuda_events:
+                break
+
+            print(
+                f"[PROFILE] {variant.name}: "
+                f"attempt {attempt + 1}/{max_profile_attempts} "
+                "returned no CUDA events; retrying",
+                flush=True,
+            )
+
+        if not cuda_events:
+            raise RuntimeError(
+                f"{variant.name}: CUDA profiler returned no GPU "
+                f"events after {max_profile_attempts} attempts. "
+                "Cannot verify attention kernel dispatch."
+            )
+
     keys = profiler_keys(prof)
+
     observed = [k for k in keys if any(re.search(regex, k, flags=re.I)
                 for regex in patterns)]
     if not observed:
@@ -1090,6 +1172,15 @@ def run_job(job: dict[str, Any], variant_name: str, output: Path):
                         if variant.attention.backend is not None else
                         {"status": "fp32_efficient", "native_varlen": False})
     model = build_model(config, state, variant, device, settings["allow_partial_state"])
+    fp8_preparation = None
+    if variant.attention.kernel_dtype == FP8_DTYPE:
+        # Calibrates on the first dataset events (also part of the evaluation set).
+        calibration = host_batches(
+            make_batches(events[:FP8_CALIBRATION_EVENTS], 1, multiple, settings["fixed_seq_len"]),
+            variant, False)
+        fp8_preparation = prepare_fp8(model, variant,
+                                      (to_gpu(batch, device, False) for batch in calibration),
+                                      device)
     parameter_validation = verify_fp32_parameters(model)
     event_isolation_validation = verify_external_kernel_event_isolation(
         variant, device, int(config.model.attention.num_heads),
@@ -1136,6 +1227,7 @@ def run_job(job: dict[str, Any], variant_name: str, output: Path):
         "fp32_parameter_validation": parameter_validation,
         "fp32_execution_validation": dtype_validation,
         "event_isolation_validation": event_isolation_validation,
+        "fp8_preparation": fp8_preparation,
         "compiled": compiled, "compile_mode": compile_mode if compiled else None,
         "compile_dynamic": settings.get("compile_dynamic", "auto") if compiled else None,
         "pad_multiple": multiple,

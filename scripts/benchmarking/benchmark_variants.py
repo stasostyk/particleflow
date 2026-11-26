@@ -34,6 +34,11 @@ class Attention:
     # library call. Worker ALSO requires a nonzero CUDA kernel event.
     expected_ops: tuple[str, ...] = ()
     compiled_expected_ops: tuple[str, ...] | None = None
+    # FP8 only (kernel_dtype float8_e4m3fn, FA3): "static" = per-layer, per-head
+    # scales calibrated once before timing; "none" = plain cast clamped to +/-448.
+    fp8_scaling: str = "none"
+    # FP8 only: fold a per-head Hadamard rotation into the projection weights.
+    fp8_hadamard: bool = False
 
 
 @dataclass(frozen=True)
@@ -66,6 +71,8 @@ class Variant:
                     list(self.attention.compiled_expected_ops)
                     if self.attention.compiled_expected_ops is not None else None
                 ),
+                "fp8_scaling": self.attention.fp8_scaling,
+                "fp8_hadamard": self.attention.fp8_hadamard,
             },
             "precision": {"allow_tf32": self.precision.allow_tf32},
             "model_dtype": "float32",
@@ -89,15 +96,19 @@ _REFERENCE = Variant(
 )
 
 
-def _flash_variant(generation: int, dtype_label: str, dtype: str) -> Variant:
+def _flash_variant(generation: int, dtype_label: str, dtype: str,
+                   fp8_scaling: str = "none", fp8_hadamard: bool = False,
+                   suffix: str = "", extra_notes: str = "") -> Variant:
     backend = f"fa{generation}"
     return Variant(
-        name=f"flash_attention_{generation}_{dtype_label}",
+        name=f"flash_attention_{generation}_{dtype_label}{suffix}",
         attention=Attention(implementation="SIMPLE", backend=backend,
                             kernel_dtype=dtype, jagged=True, varlen=True,
-                            expected_ops=(f"mlpf_external_{backend}_native_varlen",)),
+                            expected_ops=(f"mlpf_external_{backend}_native_varlen",),
+                            fp8_scaling=fp8_scaling, fp8_hadamard=fp8_hadamard),
         notes=(f"External FA{generation} native packed-varlen {dtype_label.upper()} kernel only; "
-               "full model and all other operations FP32; no backend substitutions")
+               "full model and all other operations FP32; no backend substitutions"
+               + extra_notes)
     )
 
 
@@ -105,6 +116,13 @@ _FLASH = (
     _flash_variant(2, "fp16", "float16"),
     _flash_variant(2, "bf16", "bfloat16"),
     _flash_variant(3, "fp16", "float16"),
+    # FP8 (FA3 only). The plain name is the recommended setup: static scales + Hadamard.
+    _flash_variant(3, "fp8", "float8_e4m3fn", fp8_scaling="static", fp8_hadamard=True,
+                   extra_notes="; FP8 static per-head scales + folded Hadamard rotation"),
+    _flash_variant(3, "fp8", "float8_e4m3fn", fp8_scaling="static", suffix="_static",
+                   extra_notes="; FP8 static per-head scales, no rotation"),
+    _flash_variant(3, "fp8", "float8_e4m3fn", suffix="_clamp",
+                   extra_notes="; FP8 plain cast clamped to +/-448, no scales"),
     _flash_variant(3, "bf16", "bfloat16"),
     _flash_variant(4, "fp16", "float16"),
     _flash_variant(4, "bf16", "bfloat16"),
@@ -119,6 +137,12 @@ VARIANTS: tuple[Variant, ...] = (
 REGISTRY = {v.name: v for v in VARIANTS}
 if len(REGISTRY) != len(VARIANTS):
     raise ValueError("Variant names must be unique")
+for _v in VARIANTS:
+    if _v.attention.fp8_scaling not in ("none", "static"):
+        raise ValueError(f"{_v.name}: fp8_scaling must be 'none' or 'static'")
+    if ((_v.attention.fp8_scaling != "none" or _v.attention.fp8_hadamard)
+            and _v.attention.kernel_dtype != "float8_e4m3fn"):
+        raise ValueError(f"{_v.name}: FP8 options require kernel_dtype float8_e4m3fn")
 
 
 def get_variant(name: str) -> Variant:

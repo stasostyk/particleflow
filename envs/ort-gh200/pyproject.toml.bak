@@ -1,0 +1,50 @@
+
+[project]
+name = "particleflow-ort-gh200"
+version = "3.1.0"
+requires-python = "==3.13.*"
+
+dependencies = [
+    "particleflow",
+
+    # PyTorch: ARM64 + CUDA 13.0
+    "torch==2.9.1+cu130",
+
+    # FlashAttention-3 for Hopper
+    "flash-attn-3==3.0.0b1+cu.13.0.torch.2.9",
+
+    # ARM64-compatible PyTorch Scatter
+    "torch-scatter==2.1.2+cu.13.0.torch.2.9",
+
+    # ONNX Runtime with CUDA 13
+    "onnxruntime-gpu==1.29.0",
+]
+
+[tool.uv]
+required-environments = [
+    "sys_platform == 'linux' and platform_machine == 'aarch64'",
+]
+
+# Remove FA2 but retain torch-scatter
+exclude-dependencies = [
+    { package = { name = "particleflow" },
+      dependencies = ["flash-attn"] },
+]
+
+[tool.uv.sources]
+particleflow = { path = "../.." }
+
+torch = { index = "pytorch-cu130" }
+flash-attn-3 = { index = "astral-cu130" }
+torch-scatter = { index = "astral-cu130" }
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "astral-cu130"
+url = "https://wheels.astral.sh/simple/cu130/"
+explicit = true
+
